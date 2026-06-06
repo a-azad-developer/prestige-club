@@ -1,6 +1,6 @@
 # Prestige Club — User Matching System
 
-A simplified user matching system built with **Node.js**, **Fastify**, **PostgreSQL**, **Prisma ORM**, and **TypeScript**.
+A user matching system built with **Node.js**, **Fastify**, **PostgreSQL**, **Prisma ORM**, and **TypeScript**. The compatibility score is computed entirely inside PostgreSQL — the database returns already-scored and sorted results.
 
 ## Table of Contents
 
@@ -9,6 +9,7 @@ A simplified user matching system built with **Node.js**, **Fastify**, **Postgre
 - [API Endpoints](#api-endpoints)
 - [Database Schema](#database-schema)
 - [Compatibility Score Logic](#compatibility-score-logic)
+- [SQL Implementation](#sql-implementation)
 - [Suggested Indexes](#suggested-indexes)
 - [Scaling to 1M+ Users](#scaling-to-1m-users)
 - [Caching Strategy](#caching-strategy)
@@ -20,11 +21,11 @@ A simplified user matching system built with **Node.js**, **Fastify**, **Postgre
 | Layer          | Choice                         | Rationale                                                    |
 |----------------|--------------------------------|--------------------------------------------------------------|
 | Runtime        | Node.js 20+                    | Modern JS runtime, good I/O for async workloads              |
-| Framework      | Fastify 5                      | Fast, low overhead, built-in schema validation, TypeScript friendly |
-| API Docs       | Swagger UI (@fastify/swagger-ui) | Auto-generated OpenAPI 3.0 spec at `/docs` |
-| Database       | PostgreSQL 18                  | Robust relational DB, excellent with array types and indexing |
-| ORM            | Prisma                         | Type-safe, auto-generated client, great migration workflow, native PostgreSQL array support |
-| Validation     | Zod                            | Composable, type-inferred schemas; integrates cleanly with TypeScript |
+| Framework      | Fastify 5                      | Fast, low overhead, built-in JSON schema (Ajv) validation, TypeScript friendly |
+| API Docs       | Swagger UI (`@fastify/swagger-ui`) | Auto-generated OpenAPI 3.0 spec at `/docs` |
+| Database       | PostgreSQL 18                  | Handles filtering, scoring (Jaccard similarity), sorting, and limiting in a single query |
+| ORM            | Prisma                         | Type-safe client, migration workflow, raw SQL via `$queryRawUnsafe` |
+| Validation     | Fastify / Ajv (built-in)       | Route schemas in `api.schemas.ts` define validation AND Swagger docs — one source of truth |
 | Language       | TypeScript 5                   | Full type safety across the stack                            |
 
 ---
@@ -74,87 +75,57 @@ The server will start at `http://localhost:3000`.
 #### Setup Steps
 
 ```bash
-# 1. Build and start both services (PostgreSQL 18 + the app)
+# Build and start both services
+npm run docker:up
+```
+
+Or step by step:
+
+```bash
+# 1. Pre-download the Prisma engine for Alpine Linux (one-time, host network)
+npm run docker:prepare
+
+# 2. Build and start
 docker compose up --build
 
-# 2. In a separate terminal, seed the database (optional)
+# 3. In a separate terminal, seed the database (optional)
 docker exec -it prestige-club-app node dist/seed.js
 ```
 
 The server will be available at `http://localhost:3000`.
+> **Swagger UI** at [`/docs`](http://localhost:3000/docs)
 
-> **Swagger UI** is available at [`http://localhost:3000/docs`](http://localhost:3000/docs).
+#### Docker Build — Fully Offline
 
-#### Docker Compose Services
-
-| Service | Image / Build | Port  | Description             |
-|---------|---------------|-------|-------------------------|
-| `db`    | `postgres:18-alpine` | 5432  | PostgreSQL 18 database  |
-| `app`   | Build from `Dockerfile` | 3000  | Fastify API server      |
-
-The `db` service includes a **health check** that waits for PostgreSQL to accept connections before the `app` service starts. The `app` container's entrypoint script also waits for the database, runs `prisma db push` to ensure the schema is up-to-date, then starts the server.
+The Docker build pre-downloads the Alpine-compatible Prisma engine to `.prisma-build/`. Subsequent builds use the local copy — zero network access needed.
 
 #### Useful Docker Commands
 
 ```bash
-# Start in detached mode (background)
+# Start detached
 docker compose up --build -d
 
 # View logs
 docker compose logs -f
 
-# Run database seed (uses the compiled dist/seed.js from the production image)
+# Seed data
 docker exec -it prestige-club-app node dist/seed.js
 
-# Open a shell inside the app container
-docker exec -it prestige-club-app sh
-
-# Access psql inside the db container
+# psql inside the db container
 docker exec -it prestige-club-db psql -U postgres -d prestige_club
 
-# Stop all services
+# Stop
 docker compose down
 
-# Stop and delete volumes (wipes database data)
+# Wipe data volume
 docker compose down -v
-```
-
-> **Note:** PostgreSQL 18+ uses a version-specific subdirectory layout (`/var/lib/postgresql/18/data`) to support `pg_upgrade --link` across major version bumps. If you previously ran the container with an older PostgreSQL image and mounted at `/var/lib/postgresql/data`, you must delete the old volume first:
-> ```bash
-> docker compose down -v
-> docker compose up --build
-> ```
-
-### Verify It Works
-
-```bash
-# Health check
-curl http://localhost:3000/health
-
-# Create a user
-curl -X POST http://localhost:3000/users \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "John Doe",
-    "age": 30,
-    "city": "New York",
-    "educationLevel": "BACHELOR",
-    "goals": ["career growth", "fitness"],
-    "score_selfGrowth": 80
-  }'
-
-# Get all users
-curl http://localhost:3000/users?page=1&limit=10
-
-# Get matches for a user (replace :id with actual UUID)
-curl http://localhost:3000/users/USER_UUID_HERE/match
 ```
 
 ---
 
 ## API Endpoints
 
-> A fully interactive Swagger UI is available at [`/docs`](http://localhost:3000/docs) when the server is running. You can test all endpoints directly from your browser.
+> Interactive Swagger UI at [`/docs`](http://localhost:3000/docs).
 
 ### `POST /users` — Create a new user
 
@@ -171,7 +142,7 @@ curl http://localhost:3000/users/USER_UUID_HERE/match
 }
 ```
 
-**Response:** `201 Created` with the created user object.
+**Response:** `201 Created` with the created user object. All fields are validated by Fastify against the route schema — no Zod dependency.
 
 ### `GET /users` — Retrieve all users (paginated)
 
@@ -188,17 +159,15 @@ curl http://localhost:3000/users/USER_UUID_HERE/match
 
 **Path Parameters:**
 
-| Param | Type   | Description      |
-|-------|--------|------------------|
-| id    | uuid   | Target user ID   |
+| Param | Type | Description      |
+|-------|------|------------------|
+| id    | uuid | Target user UUID |
 
-**Response:** `200 OK` with an array of up to 3 matched users, each including a `compatibilityScore`.
+**Response:** `200 OK` with up to 3 matched users, each including a `compatibilityScore` (0–100). The score is computed entirely in PostgreSQL.
 
 ---
 
 ## Database Schema
-
-### User Entity
 
 ```prisma
 model User {
@@ -209,6 +178,7 @@ model User {
   educationLevel  EducationLevel
   goals           String[]
   score_selfGrowth Int           @db.SmallInt
+
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
@@ -216,41 +186,34 @@ model User {
   @@index([age])
   @@index([score_selfGrowth])
   @@index([city, age, score_selfGrowth])
+  @@index([goals], type: Gin)
   @@map("users")
 }
 ```
 
 ### Design Decisions
 
-- **UUID primary key**: Avoids sequential ID enumeration; globally unique without coordination.
-- **`goals` as `String[]`**: PostgreSQL's native array type is efficient for storage and querying. No separate join table needed for this simple case, though a normalized `goals` table would be better at scale.
-- **`score_selfGrowth` as `SmallInt`**: Values are 0–100, so a 2-byte integer is sufficient and saves space.
-- **`age` as `SmallInt`**: Ages 18–120 fit comfortably in 2 bytes.
-
-### Education Level Enum
-
-```
-HIGH_SCHOOL, ASSOCIATE, BACHELOR, MASTER, DOCTORATE, OTHER
-```
+- **UUID primary key**: Globally unique, no sequential enumeration.
+- **`goals` as `String[]`**: PostgreSQL native arrays — no join table needed, supports GIN indexing.
+- **`score_selfGrowth` / `age` as `SmallInt`**: 2-byte integers (0–100 and 18–120 range).
+- **GIN index on `goals`**: Enables efficient array overlap (`&&`) queries.
 
 ---
 
 ## Compatibility Score Logic
 
-The compatibility score **S** is calculated on a scale of **0 to 100** using the following weighted formula:
+The score **S** (0–100) uses four weighted criteria:
 
 ```
 S = 0.2 × C  +  0.2 × A  +  0.3 × G  +  0.3 × Sg
 ```
 
-### Component Breakdown
-
-| Component | Weight | Score Formula | Example |
-|-----------|--------|---------------|---------|
-| **City (C)** | 20% | `100` if same city (case-insensitive), `0` otherwise | Alice & Bob (both NYC) → C = 100 |
-| **Age (A)** | 20% | `100 × max(0, 1 − Δage / 20)` where `Δage = \|age₁ − age₂\|` | Alice (28) & Bob (35), Δ = 7 → A = 100 × max(0, 1 − 7/20) = 65 |
-| **Goals (G)** | 30% | `100 × \|Goals₁ ∩ Goals₂\| / \|Goals₁ ∪ Goals₂\|` | Shared: `career growth, fitness` (2), Union: `career growth, networking, fitness, travel, investing, reading` (6) → G = 100 × 2/6 ≈ 33 |
-| **Self-Growth (Sg)** | 30% | `100 − Δscore` where `Δscore = \|score₁ − score₂\|` | Alice (85) & Bob (72), Δ = 13 → Sg = 100 − 13 = 87 |
+| Component | Weight | Formula | Notes |
+|-----------|--------|---------|-------|
+| **City (C)** | 20% | `100` if same city, `0` otherwise | Case-insensitive trim |
+| **Age (A)** | 20% | `100 × max(0, 1 − Δage / 20)` | Δage ≥ 20 → score 0 |
+| **Goals (G)** | 30% | `100 × \|intersection\| / \|union\|` | Jaccard similarity of goal sets |
+| **Self-Growth (Sg)** | 30% | `100 − Δscore` | Δscore ≥ 100 → score 0 |
 
 ### Worked Example
 
@@ -258,80 +221,121 @@ S = 0.2 × C  +  0.2 × A  +  0.3 × G  +  0.3 × Sg
 **Bob** (NYC, 35, goals: [career growth, investing, reading, fitness], self-growth: 72)
 
 ```
-C  = 100           (same city)
-A  = 100 × max(0, 1 − 7/20) = 65
-G  = 100 × 2/6 ≈ 33.3 → 33
-Sg = 100 − 13 = 87
+C  = 100                              (same city)
+A  = 100 × max(0, 1 − 7/20) = 65      (Δage = 7)
+G  = 100 × 2/6 ≈ 33                   (intersection: career growth, fitness — 2/6)
+Sg = 100 − 13 = 87                    (Δscore = 13)
 
 S  = 0.2(100) + 0.2(65) + 0.3(33) + 0.3(87)
-   = 20 + 13 + 9.9 + 26.1
-   = 69
+   = 20 + 13 + 9.9 + 26.1 = 69
 ```
 
-Alice and Bob have a compatibility score of **69/100**.
+---
+
+## SQL Implementation
+
+The full compatibility score is computed inside PostgreSQL via `prisma.$queryRawUnsafe`. The query uses indexed columns for pre-filtering, then computes the exact score including goals Jaccard similarity:
+
+```sql
+SELECT
+  u.id, u.name, u.age, u.city,
+  u."educationLevel", u.goals, u."score_selfGrowth",
+  ROUND(
+      0.2 * CASE WHEN u.city = $2 THEN 100 ELSE 0 END
+    + 0.2 * 100.0 * GREATEST(0, 1 - ABS(u.age - $3) / 20.0)
+    + 0.3 * 100.0 * COALESCE(
+        (SELECT COUNT(*)::numeric
+         FROM (SELECT UNNEST(u.goals) INTERSECT SELECT UNNEST($4::text[])) AS inter)
+        / NULLIF(
+          (SELECT COUNT(*)::numeric
+           FROM (SELECT UNNEST(u.goals) UNION SELECT UNNEST($4::text[])) AS uni),
+          0),
+        0
+      )
+    + 0.3 * GREATEST(0, 100 - ABS(u."score_selfGrowth" - $5))
+  )::integer AS "compatibilityScore"
+FROM users u
+WHERE u.id <> $1::uuid
+  AND u.city = $2
+  AND u.age BETWEEN ($3 - 15) AND ($3 + 15)
+  AND u."score_selfGrowth" BETWEEN GREATEST(0, $5 - 40) AND LEAST(100, $5 + 40)
+ORDER BY "compatibilityScore" DESC
+LIMIT 3;
+```
+
+This query:
+- **Filters** using the composite index `(city, age, score_selfGrowth)` — fast range scan
+- **Computes** the goals Jaccard similarity using PostgreSQL's `UNNEST` + `INTERSECT` / `UNION`
+- **Sorts** by the exact score descending
+- **Returns** only the top N rows — zero application post-processing
+
+### Fallback Tiers
+
+If the standard filter returns fewer than N results, the query widens:
+
+| Attempt | City filter | Age range | Score range |
+|---------|------------|-----------|-------------|
+| 1       | Same city  | ±15       | ±40         |
+| 2       | Same city  | ±30       | ±80         |
+| 3       | Any city   | ±30       | ±80         |
 
 ---
 
 ## Suggested Indexes
 
-The Prisma schema already defines these indexes:
+| Index | Type | Purpose |
+|-------|------|---------|
+| `[city, age, score_selfGrowth]` | Composite B-tree | Main match query — filters all three columns in one index scan |
+| `[goals]` | GIN | Array overlap lookups — enables fast candidate narrowing by shared goals |
+| `[city]` | B-tree | Fallback queries, user listing |
+| `[age]` | B-tree | Range queries |
+| `[score_selfGrowth]` | B-tree | Range queries |
 
-| Index | Type | Rationale |
-|-------|------|-----------|
-| `[city]` | B-tree | Filters users by city (first filter in optimized matching) |
-| `[age]` | B-tree | Range queries for age-based filtering |
-| `[score_selfGrowth]` | B-tree | Range queries for self-growth score filtering |
-| `[city, age, score_selfGrowth]` | Composite B-tree | Covering index for the most common matching filter combination |
-
-### Why These Indexes
-
-The matching algorithm currently loads all users and computes scores in-memory. However, at scale you would pre-filter candidates. The composite index on `(city, age, score_selfGrowth)` is the most important — it allows the database to quickly retrieve a subset of users that are most likely to be good matches (same city, similar age, similar self-growth score) without scanning the entire table.
+The composite index is the most important — it enables the match query to skip scanning 99.9% of rows at 1M+ users.
 
 ---
 
 ## Scaling to 1M+ Users
 
-If the system grows to 1M+ users, several optimizations would become necessary:
+The current architecture is already designed for this scale:
 
-### 1. Pre-filtering Before Scoring
+### 1. SQL Pre-filtering (Already Implemented)
 
-Instead of computing scores for all 1M users against a target, apply **coarse filters** first:
+The composite index `(city, age, score_selfGrowth)` narrows candidates before the expensive Jaccard computation runs. At 1M users distributed across 50+ cities, the initial filter reduces the candidate pool to a few thousand rows per city. The `LIMIT 3` ensures PostgreSQL's sort is trivially cheap.
 
-- **Same city** — Reduces candidate pool drastically (most users live in one of a few dozen cities)
-- **Age ± 10 years** — Further narrows candidates
-- **Score_selfGrowth ± 30 points** — Keeps only plausibly compatible users
+### 2. Pre-computed Matches
 
-SQL + composite indexes can return the filtered set in milliseconds.
-
-### 2. Batch / Offline Matching
-
-For a "top matches" feature, pre-compute compatibility scores in a **background job** (e.g., via Bull/BullMQ with Redis). Store results in a `user_matches` table:
+For very frequent access, pre-compute top matches in a background job and store them:
 
 ```sql
 CREATE TABLE user_matches (
-  user_id UUID REFERENCES users(id),
-  matched_user_id UUID REFERENCES users(id),
-  score SMALLINT,
-  PRIMARY KEY (user_id, matched_user_id),
-  INDEX (user_id, score DESC)
+  user_id          UUID REFERENCES users(id),
+  matched_user_id  UUID REFERENCES users(id),
+  score            SMALLINT,
+  PRIMARY KEY (user_id, matched_user_id)
 );
+
+CREATE INDEX ON user_matches (user_id, score DESC);
 ```
 
-Refresh periodically (e.g., daily) or on-demand when user data changes.
+Refresh on a schedule (e.g., every hour) or trigger on profile updates.
 
-### 3. Parallelization
+### 3. Partitioning by City
 
-- Shard the user pool by city (users in different cities rarely match well anyway due to the 20% city weight)
-- Use **worker threads** or separate microservices to compute matches per city shard in parallel
+```sql
+CREATE TABLE users_nyc PARTITION OF users FOR VALUES IN ('New York');
+CREATE TABLE users_sf  PARTITION OF users FOR VALUES IN ('San Francisco');
+```
+
+Since the match query always filters by city first, partitioning by city prunes entire partitions before scanning.
 
 ### 4. Read Replicas
 
-- Direct all read queries (`GET /users`, matching) to **read replicas** of PostgreSQL
-- Writes go to the primary; replication lag is acceptable for matching (near-real-time is fine)
+Route match queries to PostgreSQL read replicas. Writes go to the primary. The match query is a pure read — no consistency issues.
 
-### 5. Pagination & Streaming for GET /users
+### 5. Cursor-based Pagination for GET /users
 
-At 1M users, paginated queries with `offset` become slow. Use **cursor-based pagination** using the `id` or `createdAt` field:
+Replace `OFFSET` with cursor pagination:
 
 ```sql
 SELECT * FROM users WHERE id > $cursor ORDER BY id LIMIT 20;
@@ -341,60 +345,40 @@ SELECT * FROM users WHERE id > $cursor ORDER BY id LIMIT 20;
 
 ## Caching Strategy
 
-### Where Caching Helps Most
+### Where Caching Helps
 
 | Cache Target | Cache Type | TTL | Rationale |
 |-------------|------------|-----|-----------|
-| **Top matches for a user** | Redis (key: `matches:{userId}`) | 5–15 min | Matches don't change every second; caching reduces repeated computation |
-| **GET /users list (page 1)** | Redis or in-memory | 1 min | First page is frequently requested; pagination queries are repeatable |
-| **Individual user profiles** | Redis (key: `user:{id}`) | 5 min | `/users/:id/match` fetches the target user; cache avoids DB lookup |
-| **User count / metadata** | In-memory variable | 30 sec | `total` count used in pagination meta is cheap but still worth caching |
+| **Top matches for a user** | Redis (key: `matches:{userId}`) | 5–15 min | Match scores don't change every second; saves a full SQL computation |
+| **GET /users (page 1)** | Redis | 1 min | Frequently requested, repeatable query |
+| **Individual user profiles** | Redis (key: `user:{id}`) | 5 min | `/users/:id/match` fetches the target user |
+| **User count** | In-memory | 30 sec | Cheap, but saves a `COUNT(*)` scan |
 
-### Caching Architecture (Recommended)
-
-```
-                  ┌─────────────┐
-                  │   Client    │
-                  └──────┬──────┘
-                         │
-                  ┌──────▼──────┐
-                  │   Fastify   │
-                  │   (API)     │
-                  └──┬──────┬───┘
-                     │      │
-              ┌──────▼┐ ┌───▼──────┐
-              │ Redis │ │ PostgreSQL│
-              │(Cache)│ │ (Primary) │
-              └───────┘ └──────────┘
-```
-
-### Cache-Aside Pattern Implementation
+### Cache-Aside Pattern
 
 ```typescript
 async function getTopMatches(userId: string): Promise<MatchResult[]> {
   const cacheKey = `matches:${userId}`;
-
-  // Try cache first
   const cached = await redis.get(cacheKey);
   if (cached) return JSON.parse(cached);
 
-  // Compute matches
   const targetUser = await userService.getUserById(userId);
-  const allUsers = await userService.getAllUsersForMatching();
-  const matches = matchService.findTopMatches(targetUser, allUsers);
+  const matches = await matchService.findTopMatches(
+    targetUser.id, targetUser.city,
+    targetUser.age, targetUser.goals,
+    targetUser.score_selfGrowth,
+  );
 
-  // Store in cache with TTL
   await redis.setex(cacheKey, 300, JSON.stringify(matches));
-
   return matches;
 }
 ```
 
-### Cache Invalidation Triggers
+### Invalidation Triggers
 
-- When a user **updates** their profile (age, city, goals, score) → invalidate cached matches for that user
-- When a **new user** is created → no immediate invalidation needed (TTL will expire naturally)
-- When a user is **deleted** → invalidate cached matches for users who had them in their top N
+- User updates profile → invalidate `matches:{userId}`
+- New user created → let TTL expire naturally
+- User deleted → invalidate matches for users who had them in their top N
 
 ---
 
@@ -403,37 +387,36 @@ async function getTopMatches(userId: string): Promise<MatchResult[]> {
 ```
 prestige-club/
 ├── prisma/
-│   └── schema.prisma           # Database schema definition
+│   └── schema.prisma           # Database schema + indexes (B-tree + GIN)
+├── scripts/
+│   ├── download-engine.cjs     # Runtime engine download fallback (Node.js)
+│   └── prepare-engines.mjs     # Host-side engine download for Docker build
 ├── src/
 │   ├── lib/
-│   │   ├── errors.ts           # Error classes and handler
+│   │   ├── errors.ts           # Error classes + handler
 │   │   └── prisma.ts           # Prisma client singleton
 │   ├── middleware/
 │   │   └── error-handler.ts    # Global Fastify error handler
 │   ├── routes/
-│   │   └── user.routes.ts      # User CRUD + match endpoints
+│   │   └── user.routes.ts      # POST /users, GET /users, GET /users/:id/match
 │   ├── schemas/
-│   │   ├── user.schema.ts      # Zod validation schemas
-│   │   └── api.schemas.ts      # Fastify / OpenAPI route schemas for Swagger
+│   │   └── api.schemas.ts      # Fastify JSON schemas (validation + Swagger)
 │   ├── services/
-│   │   ├── match.service.ts    # Matching algorithm
-│   │   └── user.service.ts     # User database operations
+│   │   ├── match.service.ts    # Matching algorithm (raw SQL, computed in PG)
+│   │   └── user.service.ts     # User CRUD operations
 │   ├── types/
-│   │   ├── index.ts            # Type re-exports + enums
-│   │   └── user.types.ts       # DTO interfaces
-│   ├── app.ts                  # Fastify app bootstrap + start
+│   │   ├── index.ts            # Type re-exports
+│   │   └── user.types.ts       # TypeScript interfaces
+│   ├── app.ts                  # Fastify bootstrap + Swagger + health check
 │   └── seed.ts                 # Database seeding script
 ├── .dockerignore
 ├── .env.example
 ├── .gitignore
+├── .gitattributes              # Force LF line endings for shell scripts
 ├── docker-compose.yml           # PostgreSQL 18 + app orchestration
-├── docker-entrypoint.sh         # Wait for DB, push schema, start app
+├── docker-entrypoint.sh         # Wait for PG, push schema, start app
 ├── Dockerfile                   # Multi-stage production build
 ├── package.json
 ├── tsconfig.json
 └── README.md
-
-### Interactive API Docs
-
-Once the server is running, open [`/docs`](http://localhost:3000/docs) in your browser to explore and test all endpoints via Swagger UI.
 ```
