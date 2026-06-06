@@ -1,0 +1,37 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum EducationLevel {
+  HIGH_SCHOOL
+  ASSOCIATE
+  BACHELOR
+  MASTER
+  DOCTORATE
+  OTHER
+}
+
+model User {
+  id              String         @id @default(uuid()) @db.Uuid
+  name            String         @db.VarChar(255)
+  age             Int            @db.SmallInt
+  city            String         @db.VarChar(255)
+  educationLevel  EducationLevel
+  goals           String[]
+  score_selfGrowth Int           @db.SmallInt
+
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([city])
+  @@index([age])
+  @@index([score_selfGrowth])
+  @@index([city, age, score_selfGrowth])
+  @@index([goals], type: Gin)
+  @@map("users")
+}
